@@ -12,6 +12,7 @@
 #include "topics.h"
 #include "lart_msgs/msg/cone_array.hpp"
 #include "lart_msgs/msg/path_spline.hpp"
+#include "lart_msgs/msg/slam_stats.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "full_planner/full_planner.hpp"
@@ -27,7 +28,7 @@ protected:
     void slamMapCallback(const lart_msgs::msg::ConeArray::SharedPtr msg);
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
     void pathCallback(const lart_msgs::msg::PathSpline::SharedPtr msg);
-
+    void lapCallback(const lart_msgs::msg::SlamStats::SharedPtr msg);
     // Dumps the received cone map and the computed path to cones.csv and
     // path.csv under csv_output_dir_, for offline inspection with
     // scripts/plot_path.py.
@@ -36,10 +37,13 @@ protected:
 
     rclcpp::Subscription<lart_msgs::msg::ConeArray>::SharedPtr slam_map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+    rclcpp::Subscription<lart_msgs::msg::SlamStats>::SharedPtr lap_sub_;
     rclcpp::Publisher<lart_msgs::msg::PathSpline>::SharedPtr path_pub_;
 
     FullPlanner full_planner_;
     geometry_msgs::msg::PoseStamped latest_pose_;
+    bool map_completed_ = false;
+    bool path_calculated_ = false;
     bool has_pose_ = false;
     std::string csv_output_dir_;
 };

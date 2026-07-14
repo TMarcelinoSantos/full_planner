@@ -6,7 +6,7 @@ using std::placeholders::_1;
 
 PlannerNode::PlannerNode(): Node("full_planner_node")
 {
-    csv_output_dir_ = this->declare_parameter<std::string>("csv_output_dir", ".");
+    csv_output_dir_ = this->declare_parameter<std::string>("csv_output_dir", "/home/tomas/data/ros2_ws");
 
     slam_map_sub_ = this->create_subscription<lart_msgs::msg::ConeArray>(
         TOPIC_MAP, 10, std::bind(&PlannerNode::slamMapCallback, this, _1));
@@ -14,12 +14,36 @@ PlannerNode::PlannerNode(): Node("full_planner_node")
     pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
         TOPIC_SLAM_POSE, 10, std::bind(&PlannerNode::poseCallback, this, _1));
 
+    lap_sub_ = this->create_subscription<lart_msgs::msg::SlamStats>(
+        TOPIC_STATS, 10, std::bind(&PlannerNode::lapCallback, this, _1)
+    );
+
     path_pub_ = this->create_publisher<lart_msgs::msg::PathSpline>(TOPIC_PATH, 10);
+}
+
+void PlannerNode::lapCallback(const lart_msgs::msg::SlamStats::SharedPtr msg)
+{
+    RCLCPP_INFO(this->get_logger(), "Received lap stats: lap_count=%d",
+                msg->lap_count);
+
+    if(msg->lap_count > 0) {
+        this->map_completed_ = true;
+    }
 }
 
 void PlannerNode::slamMapCallback(const lart_msgs::msg::ConeArray::SharedPtr msg)
 {
     RCLCPP_INFO(this->get_logger(), "Received SLAM map with %zu cones", msg->cones.size());
+
+    if(this->path_calculated_){
+        RCLCPP_INFO(this->get_logger(), "Path has already been calculated, ignoring new map");
+        return;
+    }
+
+    if(!this->map_completed_) {
+        RCLCPP_INFO(this->get_logger(), "Map isn't completed yet, waiting for lap completion before computing path");
+        return;
+    }
 
     const lart_msgs::msg::PathSpline path = full_planner_.computePath(*msg);
     if (path.poses.empty()) {
@@ -27,6 +51,7 @@ void PlannerNode::slamMapCallback(const lart_msgs::msg::ConeArray::SharedPtr msg
         return;
     }
 
+    this->path_calculated_ = true;
     //path_pub_->publish(path);
 
     writeConesCsv(*msg);
