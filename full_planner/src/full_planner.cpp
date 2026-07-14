@@ -135,6 +135,52 @@ std::vector<std::size_t> orderPath(
     return ordered;
 }
 
+// FSD convention: driving forward, the blue boundary is on the left and the
+// yellow boundary is on the right. For a track-crossing edge, the vector
+// from the yellow cone to the blue cone points from the right boundary to
+// the left one, i.e. it *is* the left-hand direction relative to travel;
+// rotating it -90 degrees (clockwise) therefore gives the forward direction
+// consistent with "blue on the left".
+delaunay::Point forwardDirectionForBlueOnLeft(const delaunay::Point & blue, const delaunay::Point & yellow)
+{
+    const double vx = blue.x - yellow.x;
+    const double vy = blue.y - yellow.y;
+    return {vy, -vx};
+}
+
+// Orients the ordered midpoint sequence so blue cones end up on the left of
+// the direction of travel: each midpoint knows the specific blue/yellow
+// cone pair that produced it, giving a local "forward" estimate to compare
+// against the actual walk direction there. orderPath() has no colour
+// information (it only follows adjacency), so it may equally well have
+// walked the chain in the opposite direction; a majority vote over all
+// interior points decides whether to reverse it.
+bool shouldReverseForBlueOnLeft(
+    const std::vector<std::size_t> & ordered,
+    const std::vector<delaunay::Point> & midpoints,
+    const std::vector<delaunay::Point> & blue_positions,
+    const std::vector<delaunay::Point> & yellow_positions)
+{
+    int votes = 0;
+    for (std::size_t k = 1; k + 1 < ordered.size(); ++k) {
+        const delaunay::Point & prev = midpoints[ordered[k - 1]];
+        const delaunay::Point & next = midpoints[ordered[k + 1]];
+        const double travel_x = next.x - prev.x;
+        const double travel_y = next.y - prev.y;
+
+        const delaunay::Point forward =
+            forwardDirectionForBlueOnLeft(blue_positions[ordered[k]], yellow_positions[ordered[k]]);
+
+        const double dot = travel_x * forward.x + travel_y * forward.y;
+        if (dot > 0.0) {
+            ++votes;
+        } else if (dot < 0.0) {
+            --votes;
+        }
+    }
+    return votes < 0;
+}
+
 // Centered moving average over the point sequence (clamped at the ends, so
 // endpoints are smoothed with a shrinking window rather than wrapped
 // around - the path is treated as open even when the track is a closed
@@ -218,6 +264,8 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
     // the same triangle - that's how the centerline threads between
     // consecutive triangles across the track.
     std::vector<delaunay::Point> midpoints;
+    std::vector<delaunay::Point> blue_positions;
+    std::vector<delaunay::Point> yellow_positions;
     std::vector<std::vector<std::size_t>> adjacency;
     std::map<std::pair<std::size_t, std::size_t>, std::size_t> edge_to_midpoint;
 
@@ -232,6 +280,9 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
             (cone_points[i].x + cone_points[j].x) / 2.0,
             (cone_points[i].y + cone_points[j].y) / 2.0,
         });
+        const bool i_is_blue = cone_map.cones[i].class_type.data == lart_msgs::msg::Cone::BLUE;
+        blue_positions.push_back(i_is_blue ? cone_points[i] : cone_points[j]);
+        yellow_positions.push_back(i_is_blue ? cone_points[j] : cone_points[i]);
         adjacency.emplace_back();
         edge_to_midpoint.emplace(key, id);
         return id;
@@ -260,9 +311,13 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
         return path;
     }
 
-    const std::vector<std::size_t> ordered = orderPath(midpoints, adjacency);
+    std::vector<std::size_t> ordered = orderPath(midpoints, adjacency);
     if (ordered.size() < 2) {
         return path;
+    }
+
+    if (shouldReverseForBlueOnLeft(ordered, midpoints, blue_positions, yellow_positions)) {
+        std::reverse(ordered.begin(), ordered.end());
     }
 
     std::vector<delaunay::Point> ordered_points;
