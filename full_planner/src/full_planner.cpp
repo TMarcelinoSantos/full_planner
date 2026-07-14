@@ -246,15 +246,25 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
     lart_msgs::msg::PathSpline path;
     path.header = cone_map.header;
 
-    const std::size_t cone_count = cone_map.cones.size();
-    if (cone_count < 3) {
-        return path;
-    }
-
+    // Only blue/yellow boundary cones take part in the triangulation.
+    // Orange (start/finish gate) and unknown cones have no defined side of
+    // the track, and - being physically inside the gate, between the
+    // flanking blue/yellow cones - would otherwise sit in the way of the
+    // Delaunay edges that should directly connect those flanking cones,
+    // leaving a gap in the centerline right at the gate.
     std::vector<delaunay::Point> cone_points;
-    cone_points.reserve(cone_count);
-    for (const auto & cone : cone_map.cones) {
-        cone_points.push_back(toPoint(cone.position));
+    std::vector<std::size_t> boundary_cone_indices;
+    cone_points.reserve(cone_map.cones.size());
+    boundary_cone_indices.reserve(cone_map.cones.size());
+    for (std::size_t i = 0; i < cone_map.cones.size(); ++i) {
+        const auto class_type = cone_map.cones[i].class_type.data;
+        if (class_type == lart_msgs::msg::Cone::BLUE || class_type == lart_msgs::msg::Cone::YELLOW) {
+            cone_points.push_back(toPoint(cone_map.cones[i].position));
+            boundary_cone_indices.push_back(i);
+        }
+    }
+    if (cone_points.size() < 3) {
+        return path;
     }
 
     const auto triangles = delaunay::triangulate(cone_points);
@@ -280,7 +290,8 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
             (cone_points[i].x + cone_points[j].x) / 2.0,
             (cone_points[i].y + cone_points[j].y) / 2.0,
         });
-        const bool i_is_blue = cone_map.cones[i].class_type.data == lart_msgs::msg::Cone::BLUE;
+        const bool i_is_blue =
+            cone_map.cones[boundary_cone_indices[i]].class_type.data == lart_msgs::msg::Cone::BLUE;
         blue_positions.push_back(i_is_blue ? cone_points[i] : cone_points[j]);
         yellow_positions.push_back(i_is_blue ? cone_points[j] : cone_points[i]);
         adjacency.emplace_back();
@@ -294,7 +305,7 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
         for (int e = 0; e < 3; ++e) {
             const std::size_t i = verts[e];
             const std::size_t j = verts[(e + 1) % 3];
-            if (isTrackCrossingEdge(cone_map.cones[i], cone_map.cones[j])) {
+            if (isTrackCrossingEdge(cone_map.cones[boundary_cone_indices[i]], cone_map.cones[boundary_cone_indices[j]])) {
                 crossing_midpoints.push_back(midpointIdForEdge(i, j));
             }
         }
@@ -326,7 +337,20 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
         ordered_points.push_back(midpoints[idx]);
     }
 
-    const std::vector<delaunay::Point> smoothed = smoothPolyline(ordered_points, kSmoothingHalfWindow);
+    std::vector<delaunay::Point> smoothed = smoothPolyline(ordered_points, kSmoothingHalfWindow);
+
+    // If every point has exactly two neighbours, the track has no
+    // start/finish gap and the walk above traced a full ring - the "cut"
+    // into a linear list still happened at some arbitrary point though, so
+    // close the ring back up explicitly (repeat its first point at the
+    // end) rather than leaving a seam there.
+    const bool is_closed_loop = std::none_of(
+        adjacency.begin(), adjacency.end(),
+        [](const std::vector<std::size_t> & neighbors) { return neighbors.size() <= 1; });
+    if (is_closed_loop) {
+        smoothed.push_back(smoothed.front());
+    }
+
     const std::vector<delaunay::Point> resampled = resampleAtSpacing(smoothed, kPathPointSpacingM);
     if (resampled.size() < 2) {
         return path;
