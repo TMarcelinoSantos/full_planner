@@ -14,6 +14,14 @@ namespace
 
 constexpr std::size_t kInvalidIndex = std::numeric_limits<std::size_t>::max();
 
+// Target point density: 100 points per 20 m of path.
+constexpr double kPathPointSpacingM = 20.0 / 100.0;
+
+// Half-width (in points) of the moving-average smoothing window applied to
+// the raw Delaunay-edge midpoints before resampling, to smooth out the
+// zig-zag those midpoints otherwise have from cone-to-cone jitter.
+constexpr int kSmoothingHalfWindow = 2;
+
 delaunay::Point toPoint(const geometry_msgs::msg::Point & p)
 {
     return {p.x, p.y};
@@ -127,6 +135,64 @@ std::vector<std::size_t> orderPath(
     return ordered;
 }
 
+// Centered moving average over the point sequence (clamped at the ends, so
+// endpoints are smoothed with a shrinking window rather than wrapped
+// around - the path is treated as open even when the track is a closed
+// loop, since the start/finish gap already breaks it there).
+std::vector<delaunay::Point> smoothPolyline(const std::vector<delaunay::Point> & points, int half_window)
+{
+    const std::size_t n = points.size();
+    std::vector<delaunay::Point> smoothed(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t lo = (i >= static_cast<std::size_t>(half_window)) ? i - half_window : 0;
+        const std::size_t hi = std::min(n - 1, i + static_cast<std::size_t>(half_window));
+
+        double sum_x = 0.0;
+        double sum_y = 0.0;
+        for (std::size_t j = lo; j <= hi; ++j) {
+            sum_x += points[j].x;
+            sum_y += points[j].y;
+        }
+        const double count = static_cast<double>(hi - lo + 1);
+        smoothed[i] = {sum_x / count, sum_y / count};
+    }
+    return smoothed;
+}
+
+// Resamples the polyline to uniform arc-length spacing via linear
+// interpolation between the (already smoothed) input points, always
+// including the original last point so the resampled path still reaches
+// the end of the track.
+std::vector<delaunay::Point> resampleAtSpacing(const std::vector<delaunay::Point> & points, double spacing)
+{
+    if (points.size() < 2) {
+        return points;
+    }
+
+    std::vector<double> cumulative(points.size(), 0.0);
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        cumulative[i] = cumulative[i - 1] + std::hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y);
+    }
+    const double total_length = cumulative.back();
+
+    std::vector<delaunay::Point> resampled;
+    std::size_t seg = 0;
+    for (double target = 0.0; target < total_length; target += spacing) {
+        while (seg + 2 < points.size() && cumulative[seg + 1] < target) {
+            ++seg;
+        }
+        const double seg_len = cumulative[seg + 1] - cumulative[seg];
+        const double t = seg_len > 1e-9 ? (target - cumulative[seg]) / seg_len : 0.0;
+        resampled.push_back({
+            points[seg].x + t * (points[seg + 1].x - points[seg].x),
+            points[seg].y + t * (points[seg + 1].y - points[seg].y),
+        });
+    }
+    resampled.push_back(points.back());
+
+    return resampled;
+}
+
 }  // namespace
 
 lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeArray & cone_map) const
@@ -199,20 +265,32 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
         return path;
     }
 
-    path.poses.reserve(ordered.size());
-    path.curvature.reserve(ordered.size());
-    path.distance.reserve(ordered.size());
+    std::vector<delaunay::Point> ordered_points;
+    ordered_points.reserve(ordered.size());
+    for (const std::size_t idx : ordered) {
+        ordered_points.push_back(midpoints[idx]);
+    }
+
+    const std::vector<delaunay::Point> smoothed = smoothPolyline(ordered_points, kSmoothingHalfWindow);
+    const std::vector<delaunay::Point> resampled = resampleAtSpacing(smoothed, kPathPointSpacingM);
+    if (resampled.size() < 2) {
+        return path;
+    }
+
+    path.poses.reserve(resampled.size());
+    path.curvature.reserve(resampled.size());
+    path.distance.reserve(resampled.size());
 
     double cumulative_distance = 0.0;
-    for (std::size_t k = 0; k < ordered.size(); ++k) {
-        const delaunay::Point & p = midpoints[ordered[k]];
+    for (std::size_t k = 0; k < resampled.size(); ++k) {
+        const delaunay::Point & p = resampled[k];
 
         double yaw;
-        if (k + 1 < ordered.size()) {
-            const delaunay::Point & next = midpoints[ordered[k + 1]];
+        if (k + 1 < resampled.size()) {
+            const delaunay::Point & next = resampled[k + 1];
             yaw = std::atan2(next.y - p.y, next.x - p.x);
         } else {
-            const delaunay::Point & prev = midpoints[ordered[k - 1]];
+            const delaunay::Point & prev = resampled[k - 1];
             yaw = std::atan2(p.y - prev.y, p.x - prev.x);
         }
 
@@ -225,14 +303,13 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
         path.poses.push_back(pose);
 
         if (k > 0) {
-            const delaunay::Point & prev = midpoints[ordered[k - 1]];
+            const delaunay::Point & prev = resampled[k - 1];
             cumulative_distance += std::hypot(p.x - prev.x, p.y - prev.y);
         }
         path.distance.push_back(static_cast<float>(cumulative_distance));
 
-        if (k > 0 && k + 1 < ordered.size()) {
-            path.curvature.push_back(curvatureAt(
-                midpoints[ordered[k - 1]], midpoints[ordered[k]], midpoints[ordered[k + 1]]));
+        if (k > 0 && k + 1 < resampled.size()) {
+            path.curvature.push_back(curvatureAt(resampled[k - 1], resampled[k], resampled[k + 1]));
         } else {
             path.curvature.push_back(0.0f);
         }
