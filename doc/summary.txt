@@ -1,0 +1,39 @@
+1. Filter cones (full_planner.cpp:451-464)
+From the incoming ConeArray, keep only BLUE and YELLOW cones (orange start/finish cones are dropped) as 2D points. Bail out early if fewer than 3 remain — not enough to triangulate.
+
+2. Delaunay triangulation (full_planner.cpp:466)
+Run a self-contained Bowyer-Watson triangulation (delaunay::triangulate, in delaunay.hpp) over the blue/yellow cone points. This produces a mesh of triangles connecting nearby cones.
+
+3. Extract centerline midpoints (full_planner.cpp:468-519)
+An edge "crosses the track" when it joins one blue cone to one yellow cone (isTrackCrossingEdge) — its midpoint sits on the centerline. For every triangle, find its track-crossing edges (0, 1, or 2 of them — two colors means at most 2 per triangle) and:
+
+Record each crossing edge's midpoint (deduplicated across the two triangles that share it), remembering which specific blue/yellow cone pair produced it.
+If a triangle has two crossing edges, link their midpoints as adjacent — this is what threads the centerline through consecutive triangles across the track. This builds an adjacency graph over midpoints.
+4. Order the midpoints into a path (full_planner.cpp:275-338, orderPath)
+Walk the adjacency graph into a single ordered sequence: start from a degree-≤1 endpoint if one exists (the start/finish gap breaks the alternating blue/yellow pattern there), otherwise it's a closed ring. At each step, continue to whichever unvisited neighbor keeps the walk "straightest" (best dot-product against the previous step's direction) — this keeps the walk on the main chain even where a handful of stray triangles create a branch.
+
+5. Orient it "blue on the left" (full_planner.cpp:340-384)
+orderPath has no color information, so it may have walked in either direction. shouldReverseForBlueOnLeft takes a majority vote over all interior points, comparing actual travel direction against the "blue-cone-on-the-left" direction implied by each point's source cone pair, and reverses the whole sequence if the vote says it's backwards.
+
+6. Smooth (full_planner.cpp:390-408, smoothPolyline)
+A centered moving-average filter (half-window = 2) over the ordered midpoints, to smooth out the zig-zag those raw midpoints have from cone-to-cone jitter.
+
+7. Close the ring if needed (full_planner.cpp:543-548)
+If every midpoint has exactly 2 neighbors, there's no start/finish gap — it's a full loop, so explicitly repeat the first point at the end (is_closed_loop = true) to close the seam left by cutting the ring into a linear list.
+
+8. Resample to uniform spacing (full_planner.cpp:414-442, resampleAtSpacing)
+Linearly interpolate the smoothed polyline to a fixed 0.2 m spacing (100 points per 20 m), always including the true last point.
+
+9. Per-point curvature (full_planner.cpp:147-200, curvatureAtWindow)
+For each resampled point, take a 9-point window around it (cyclic for a closed loop, shrinking near the ends for an open path), algebraically fit a circle to the window (hyperFitCircle — the "Hyper Fit" method, same principle as ft_fsd_path_planning's circle_fit), clamp the radius to [1, 3000] m, and sign it (+ = left turn, − = right turn) from the orientation of the window's first/middle/last points. curvature = sign / radius.
+
+10. Per-point target speed (full_planner.cpp:202-265, applyVelocityProfile)
+A 3-pass friction-circle speed profile (Stage 2, Option A from ARCHITECTURE2_NEW_DESIGN.md) run once over the whole finished array, start to end:
+
+Pass 1: cap each point at the speed lateral grip alone allows (√(mu_lat·g/κ), clamped to v_max).
+Pass 2: backward sweep — no point may demand more braking into the next corner than mu_brake·g provides (friction-circle remainder after lateral grip).
+Pass 3: forward sweep — same, for accelerating out of the previous corner with mu_drive·g.
+No launch/standstill anchoring (car is assumed already moving) and no closed-loop wraparound handling yet — it's treated as a plain array from front to back.
+
+Output
+path.points: x, y, distance (cumulative arc length), curvature, velocity — written out by PlannerNode::writePathCsv to path.csv.
