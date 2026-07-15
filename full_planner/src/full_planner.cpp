@@ -42,41 +42,104 @@ bool isTrackCrossingEdge(const lart_msgs::msg::Cone & a, const lart_msgs::msg::C
            (ca == lart_msgs::msg::Cone::BLUE && cb == lart_msgs::msg::Cone::YELLOW);
 }
 
-// Solves the 3x3 linear system m*x = b via Cramer's rule. Returns false
-// (leaving x untouched) if m is singular.
-bool solve3x3(const double m[3][3], const double b[3], double x[3])
-{
-    auto det3 = [](double a00, double a01, double a02, double a10, double a11, double a12, double a20,
-                    double a21, double a22) {
-        return a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
-    };
+// Minimum/maximum radius (in metres) a circle fit is allowed to produce,
+// same clamp used by ft_fsd_path_planning's circle_fit()-based curvature
+// (fsd_path_planning/calculate_path/path_parameterization.py).
+constexpr double kMinFitRadiusM = 1.0;
+constexpr double kMaxFitRadiusM = 3000.0;
 
-    const double det = det3(
-        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]);
-    if (std::abs(det) < 1e-9) {
+// Algebraically fits a circle to `points` using the "Hyper Fit" method
+// (Al-Sharadqah & Chernov), ported line-for-line from circle_fit() in
+// ft_fsd_path_planning's fsd_path_planning/utils/math_utils.py (itself
+// adapted from the circle-fit PyPI package). Returns false (leaving the
+// outputs untouched) if the fit is degenerate.
+bool hyperFitCircle(const std::vector<delaunay::Point> & points, double & radius)
+{
+    const std::size_t n = points.size();
+    if (n < 3) {
         return false;
     }
 
-    x[0] = det3(b[0], m[0][1], m[0][2], b[1], m[1][1], m[1][2], b[2], m[2][1], m[2][2]) / det;
-    x[1] = det3(m[0][0], b[0], m[0][2], m[1][0], b[1], m[1][2], m[2][0], b[2], m[2][2]) / det;
-    x[2] = det3(m[0][0], m[0][1], b[0], m[1][0], m[1][1], b[1], m[2][0], m[2][1], b[2]) / det;
+    double mean_x = 0.0, mean_y = 0.0;
+    for (const auto & p : points) {
+        mean_x += p.x;
+        mean_y += p.y;
+    }
+    mean_x /= static_cast<double>(n);
+    mean_y /= static_cast<double>(n);
+
+    double mxy = 0.0, mxx = 0.0, myy = 0.0, mxz = 0.0, myz = 0.0, mzz = 0.0;
+    for (const auto & p : points) {
+        const double xi = p.x - mean_x;
+        const double yi = p.y - mean_y;
+        const double zi = xi * xi + yi * yi;
+        mxy += xi * yi;
+        mxx += xi * xi;
+        myy += yi * yi;
+        mxz += xi * zi;
+        myz += yi * zi;
+        mzz += zi * zi;
+    }
+    const double inv_n = 1.0 / static_cast<double>(n);
+    mxy *= inv_n;
+    mxx *= inv_n;
+    myy *= inv_n;
+    mxz *= inv_n;
+    myz *= inv_n;
+    mzz *= inv_n;
+
+    const double mz = mxx + myy;
+    const double cov_xy = mxx * myy - mxy * mxy;
+    const double var_z = mzz - mz * mz;
+
+    const double a2 = 4.0 * cov_xy - 3.0 * mz * mz - mzz;
+    const double a1 = var_z * mz + 4.0 * cov_xy * mz - mxz * mxz - myz * myz;
+    const double a0 = mxz * (mxz * myy - myz * mxy) + myz * (myz * mxx - mxz * mxy) - var_z * cov_xy;
+    const double a22 = a2 + a2;
+
+    // Newton iteration on the fit's characteristic polynomial root.
+    double x = 0.0;
+    double y = a0;
+    constexpr int kMaxIter = 99;
+    for (int iter = 0; iter < kMaxIter; ++iter) {
+        const double dy = a1 + x * (a22 + 16.0 * x * x);
+        if (dy == 0.0) {
+            break;
+        }
+        const double x_new = x - y / dy;
+        if (x_new == x || !std::isfinite(x_new)) {
+            break;
+        }
+        const double y_new = a0 + x_new * (a1 + x_new * (a2 + 4.0 * x_new * x_new));
+        if (std::abs(y_new) >= std::abs(y)) {
+            break;
+        }
+        x = x_new;
+        y = y_new;
+    }
+
+    const double det = x * x - x * mz + cov_xy;
+    if (std::abs(det) < 1e-12) {
+        return false;
+    }
+
+    const double center_x = (mxz * (myy - x) - myz * mxy) / det / 2.0;
+    const double center_y = (myz * (mxx - x) - mxz * mxy) / det / 2.0;
+    radius = std::sqrt(std::abs(center_x * center_x + center_y * center_y + mz));
     return true;
 }
 
 // Curvature at points[center] (1/radius, positive for a left turn),
 // estimated from a window of up to half_window points on each side of it
-// (2*half_window+1 in total, including the point itself) rather than just
-// its two immediate neighbours - much less sensitive to point-to-point
-// jitter than a plain 3-point estimate. The window's x(s) and y(s) are each
-// fit with a least-squares quadratic against arc-length position s (points
-// are evenly spaced at this stage, so s is just each point's offset from
-// the centre in multiples of point_spacing); curvature then follows from
-// the standard parametric formula using the fit's 1st/2nd derivatives at
-// s=0. A local polynomial regression was used here rather than an
-// algebraic circle fit (e.g. Kasa) because circle fits are biased toward
-// spuriously small radii on near-straight windows - this doesn't have that
-// bias, since it's estimating a Taylor expansion of the curve rather than
-// forcing the points onto a circle.
+// (2*half_window+1 in total, including the point itself). This mirrors the
+// curvature principle used in ft_fsd_path_planning
+// (calculate_path_curvature() in
+// fsd_path_planning/calculate_path/path_parameterization.py): an algebraic
+// circle is fit to the window via hyperFitCircle() above, its radius
+// clamped to [kMinFitRadiusM, kMaxFitRadiusM], and the sign of the
+// curvature (left vs. right turn) comes from the orientation (signed area)
+// of the window's first, middle, and last points, rather than from the
+// circle fit itself.
 //
 // For a closed loop, resampled.front() == resampled.back() (see the
 // ring-closing step in computePath), so the window wraps cyclically
@@ -84,17 +147,14 @@ bool solve3x3(const double m[3][3], const double b[3], double x[3])
 // open path the window simply shrinks near the two real endpoints instead
 // of wrapping.
 float curvatureAtWindow(
-    const std::vector<delaunay::Point> & points, std::size_t center, int half_window, bool is_closed_loop,
-    double point_spacing)
+    const std::vector<delaunay::Point> & points, std::size_t center, int half_window, bool is_closed_loop)
 {
     std::vector<delaunay::Point> window;
-    std::vector<double> s;
     if (is_closed_loop && points.size() > 1) {
         const long long m = static_cast<long long>(points.size()) - 1;
         for (int offset = -half_window; offset <= half_window; ++offset) {
             const long long idx = ((static_cast<long long>(center) + offset) % m + m) % m;
             window.push_back(points[static_cast<std::size_t>(idx)]);
-            s.push_back(offset * point_spacing);
         }
     } else {
         const std::size_t n = points.size();
@@ -102,7 +162,6 @@ float curvatureAtWindow(
         const std::size_t hi = std::min(n - 1, center + static_cast<std::size_t>(half_window));
         for (std::size_t idx = lo; idx <= hi; ++idx) {
             window.push_back(points[idx]);
-            s.push_back((static_cast<double>(idx) - static_cast<double>(center)) * point_spacing);
         }
     }
 
@@ -110,48 +169,19 @@ float curvatureAtWindow(
         return 0.0f;
     }
 
-    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
-    double sx0 = 0.0, sx1 = 0.0, sx2 = 0.0, sy0 = 0.0, sy1 = 0.0, sy2 = 0.0;
-    for (std::size_t i = 0; i < window.size(); ++i) {
-        const double si = s[i];
-        const double si2 = si * si;
-        s0 += 1.0;
-        s1 += si;
-        s2 += si2;
-        s3 += si2 * si;
-        s4 += si2 * si2;
-        sx0 += window[i].x;
-        sx1 += si * window[i].x;
-        sx2 += si2 * window[i].x;
-        sy0 += window[i].y;
-        sy1 += si * window[i].y;
-        sy2 += si2 * window[i].y;
-    }
-
-    const double m[3][3] = {
-        {s0, s1, s2},
-        {s1, s2, s3},
-        {s2, s3, s4},
-    };
-    const double rhs_x[3] = {sx0, sx1, sx2};
-    const double rhs_y[3] = {sy0, sy1, sy2};
-    double ax[3];
-    double ay[3];
-    if (!solve3x3(m, rhs_x, ax) || !solve3x3(m, rhs_y, ay)) {
+    double radius = 0.0;
+    if (!hyperFitCircle(window, radius)) {
         return 0.0f;
     }
+    radius = std::min(std::max(radius, kMinFitRadiusM), kMaxFitRadiusM);
 
-    const double xp = ax[1];
-    const double xpp = 2.0 * ax[2];
-    const double yp = ay[1];
-    const double ypp = 2.0 * ay[2];
+    const delaunay::Point & p0 = window.front();
+    const delaunay::Point & pm = window[window.size() / 2];
+    const delaunay::Point & p1 = window.back();
+    const double signed_area = (pm.x - p0.x) * (p1.y - p0.y) - (pm.y - p0.y) * (p1.x - p0.x);
+    const double sign = (signed_area > 0.0) ? 1.0 : ((signed_area < 0.0) ? -1.0 : 0.0);
 
-    const double denom_sq = xp * xp + yp * yp;
-    if (denom_sq < 1e-12) {
-        return 0.0f;
-    }
-
-    return static_cast<float>((xp * ypp - yp * xpp) / std::pow(denom_sq, 1.5));
+    return static_cast<float>(sign / radius);
 }
 
 // Walks the midpoint adjacency graph into a single ordered sequence covering
@@ -458,8 +488,7 @@ lart_msgs::msg::PathArray FullPlanner::computePath(const lart_msgs::msg::ConeArr
         }
         point.distance = static_cast<float>(cumulative_distance);
 
-        point.curvature =
-            curvatureAtWindow(resampled, k, kCurvatureHalfWindow, is_closed_loop, kPathPointSpacingM);
+        point.curvature = curvatureAtWindow(resampled, k, kCurvatureHalfWindow, is_closed_loop);
 
         // No velocity profile yet - left at the field's default (0).
         path.points.push_back(point);
