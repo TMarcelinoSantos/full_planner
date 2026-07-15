@@ -18,7 +18,7 @@ PlannerNode::PlannerNode(): Node("full_planner_node")
         TOPIC_STATS, 10, std::bind(&PlannerNode::lapCallback, this, _1)
     );
 
-    path_pub_ = this->create_publisher<lart_msgs::msg::PathSpline>(TOPIC_PATH, 10);
+    path_pub_ = this->create_publisher<lart_msgs::msg::PathArray>(TOPIC_PATH, 10);
 }
 
 void PlannerNode::lapCallback(const lart_msgs::msg::SlamStats::SharedPtr msg)
@@ -45,8 +45,8 @@ void PlannerNode::slamMapCallback(const lart_msgs::msg::ConeArray::SharedPtr msg
         return;
     }
 
-    const lart_msgs::msg::PathSpline path = full_planner_.computePath(*msg);
-    if (path.poses.empty()) {
+    const lart_msgs::msg::PathArray path = full_planner_.computePath(*msg);
+    if (path.points.empty()) {
         RCLCPP_WARN(this->get_logger(), "Could not build a midline path from the received cone map");
         return;
     }
@@ -75,7 +75,7 @@ void PlannerNode::writeConesCsv(const lart_msgs::msg::ConeArray & cone_map) cons
     RCLCPP_INFO(this->get_logger(), "Wrote %zu cones to '%s'", cone_map.cones.size(), filepath.c_str());
 }
 
-void PlannerNode::writePathCsv(const lart_msgs::msg::PathSpline & path) const
+void PlannerNode::writePathCsv(const lart_msgs::msg::PathArray & path) const
 {
     const std::string filepath = csv_output_dir_ + "/path.csv";
     std::ofstream file(filepath);
@@ -84,13 +84,13 @@ void PlannerNode::writePathCsv(const lart_msgs::msg::PathSpline & path) const
         return;
     }
 
-    file << "index,x,y,distance,curvature\n";
-    for (std::size_t i = 0; i < path.poses.size(); ++i) {
-        const auto & p = path.poses[i].pose.position;
+    file << "index,x,y,distance,curvature,velocity\n";
+    for (std::size_t i = 0; i < path.points.size(); ++i) {
+        const auto & p = path.points[i];
         file << i << ',' << p.x << ',' << p.y << ','
-             << path.distance[i] << ',' << path.curvature[i] << '\n';
+             << p.distance << ',' << p.curvature << ',' << p.velocity << '\n';
     }
-    RCLCPP_INFO(this->get_logger(), "Wrote %zu path points to '%s'", path.poses.size(), filepath.c_str());
+    RCLCPP_INFO(this->get_logger(), "Wrote %zu path points to '%s'", path.points.size(), filepath.c_str());
 }
 
 void PlannerNode::poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)

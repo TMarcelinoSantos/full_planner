@@ -22,6 +22,11 @@ constexpr double kPathPointSpacingM = 20.0 / 100.0;
 // zig-zag those midpoints otherwise have from cone-to-cone jitter.
 constexpr int kSmoothingHalfWindow = 2;
 
+// Half-width (in resampled points) of the window used to estimate curvature
+// at each path point: 4 points before it and 4 after, 9 in total including
+// the point itself.
+constexpr int kCurvatureHalfWindow = 4;
+
 delaunay::Point toPoint(const geometry_msgs::msg::Point & p)
 {
     return {p.x, p.y};
@@ -37,29 +42,116 @@ bool isTrackCrossingEdge(const lart_msgs::msg::Cone & a, const lart_msgs::msg::C
            (ca == lart_msgs::msg::Cone::BLUE && cb == lart_msgs::msg::Cone::YELLOW);
 }
 
-geometry_msgs::msg::Quaternion quaternionFromYaw(double yaw)
+// Solves the 3x3 linear system m*x = b via Cramer's rule. Returns false
+// (leaving x untouched) if m is singular.
+bool solve3x3(const double m[3][3], const double b[3], double x[3])
 {
-    geometry_msgs::msg::Quaternion q;
-    q.x = 0.0;
-    q.y = 0.0;
-    q.z = std::sin(yaw / 2.0);
-    q.w = std::cos(yaw / 2.0);
-    return q;
+    auto det3 = [](double a00, double a01, double a02, double a10, double a11, double a12, double a20,
+                    double a21, double a22) {
+        return a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
+    };
+
+    const double det = det3(
+        m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]);
+    if (std::abs(det) < 1e-9) {
+        return false;
+    }
+
+    x[0] = det3(b[0], m[0][1], m[0][2], b[1], m[1][1], m[1][2], b[2], m[2][1], m[2][2]) / det;
+    x[1] = det3(m[0][0], b[0], m[0][2], m[1][0], b[1], m[1][2], m[2][0], b[2], m[2][2]) / det;
+    x[2] = det3(m[0][0], m[0][1], b[0], m[1][0], m[1][1], b[1], m[2][0], m[2][1], b[2]) / det;
+    return true;
 }
 
-// Signed Menger curvature of the three points (1/radius of the circle
-// through them, positive for a left turn).
-float curvatureAt(const delaunay::Point & p0, const delaunay::Point & p1, const delaunay::Point & p2)
+// Curvature at points[center] (1/radius, positive for a left turn),
+// estimated from a window of up to half_window points on each side of it
+// (2*half_window+1 in total, including the point itself) rather than just
+// its two immediate neighbours - much less sensitive to point-to-point
+// jitter than a plain 3-point estimate. The window's x(s) and y(s) are each
+// fit with a least-squares quadratic against arc-length position s (points
+// are evenly spaced at this stage, so s is just each point's offset from
+// the centre in multiples of point_spacing); curvature then follows from
+// the standard parametric formula using the fit's 1st/2nd derivatives at
+// s=0. A local polynomial regression was used here rather than an
+// algebraic circle fit (e.g. Kasa) because circle fits are biased toward
+// spuriously small radii on near-straight windows - this doesn't have that
+// bias, since it's estimating a Taylor expansion of the curve rather than
+// forcing the points onto a circle.
+//
+// For a closed loop, resampled.front() == resampled.back() (see the
+// ring-closing step in computePath), so the window wraps cyclically
+// through the distinct points [0, m) where m = points.size()-1; for an
+// open path the window simply shrinks near the two real endpoints instead
+// of wrapping.
+float curvatureAtWindow(
+    const std::vector<delaunay::Point> & points, std::size_t center, int half_window, bool is_closed_loop,
+    double point_spacing)
 {
-    const double a = std::hypot(p1.x - p0.x, p1.y - p0.y);
-    const double b = std::hypot(p2.x - p1.x, p2.y - p1.y);
-    const double c = std::hypot(p2.x - p0.x, p2.y - p0.y);
-    const double cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
-    const double denom = a * b * c;
-    if (denom < 1e-9) {
+    std::vector<delaunay::Point> window;
+    std::vector<double> s;
+    if (is_closed_loop && points.size() > 1) {
+        const long long m = static_cast<long long>(points.size()) - 1;
+        for (int offset = -half_window; offset <= half_window; ++offset) {
+            const long long idx = ((static_cast<long long>(center) + offset) % m + m) % m;
+            window.push_back(points[static_cast<std::size_t>(idx)]);
+            s.push_back(offset * point_spacing);
+        }
+    } else {
+        const std::size_t n = points.size();
+        const std::size_t lo = (center >= static_cast<std::size_t>(half_window)) ? center - half_window : 0;
+        const std::size_t hi = std::min(n - 1, center + static_cast<std::size_t>(half_window));
+        for (std::size_t idx = lo; idx <= hi; ++idx) {
+            window.push_back(points[idx]);
+            s.push_back((static_cast<double>(idx) - static_cast<double>(center)) * point_spacing);
+        }
+    }
+
+    if (window.size() < 3) {
         return 0.0f;
     }
-    return static_cast<float>(2.0 * cross / denom);
+
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
+    double sx0 = 0.0, sx1 = 0.0, sx2 = 0.0, sy0 = 0.0, sy1 = 0.0, sy2 = 0.0;
+    for (std::size_t i = 0; i < window.size(); ++i) {
+        const double si = s[i];
+        const double si2 = si * si;
+        s0 += 1.0;
+        s1 += si;
+        s2 += si2;
+        s3 += si2 * si;
+        s4 += si2 * si2;
+        sx0 += window[i].x;
+        sx1 += si * window[i].x;
+        sx2 += si2 * window[i].x;
+        sy0 += window[i].y;
+        sy1 += si * window[i].y;
+        sy2 += si2 * window[i].y;
+    }
+
+    const double m[3][3] = {
+        {s0, s1, s2},
+        {s1, s2, s3},
+        {s2, s3, s4},
+    };
+    const double rhs_x[3] = {sx0, sx1, sx2};
+    const double rhs_y[3] = {sy0, sy1, sy2};
+    double ax[3];
+    double ay[3];
+    if (!solve3x3(m, rhs_x, ax) || !solve3x3(m, rhs_y, ay)) {
+        return 0.0f;
+    }
+
+    const double xp = ax[1];
+    const double xpp = 2.0 * ax[2];
+    const double yp = ay[1];
+    const double ypp = 2.0 * ay[2];
+
+    const double denom_sq = xp * xp + yp * yp;
+    if (denom_sq < 1e-12) {
+        return 0.0f;
+    }
+
+    return static_cast<float>((xp * ypp - yp * xpp) / std::pow(denom_sq, 1.5));
 }
 
 // Walks the midpoint adjacency graph into a single ordered sequence covering
@@ -241,17 +333,11 @@ std::vector<delaunay::Point> resampleAtSpacing(const std::vector<delaunay::Point
 
 }  // namespace
 
-lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeArray & cone_map) const
+lart_msgs::msg::PathArray FullPlanner::computePath(const lart_msgs::msg::ConeArray & cone_map) const
 {
-    lart_msgs::msg::PathSpline path;
+    lart_msgs::msg::PathArray path;
     path.header = cone_map.header;
 
-    // Only blue/yellow boundary cones take part in the triangulation.
-    // Orange (start/finish gate) and unknown cones have no defined side of
-    // the track, and - being physically inside the gate, between the
-    // flanking blue/yellow cones - would otherwise sit in the way of the
-    // Delaunay edges that should directly connect those flanking cones,
-    // leaving a gap in the centerline right at the gate.
     std::vector<delaunay::Point> cone_points;
     std::vector<std::size_t> boundary_cone_indices;
     cone_points.reserve(cone_map.cones.size());
@@ -356,42 +442,27 @@ lart_msgs::msg::PathSpline FullPlanner::computePath(const lart_msgs::msg::ConeAr
         return path;
     }
 
-    path.poses.reserve(resampled.size());
-    path.curvature.reserve(resampled.size());
-    path.distance.reserve(resampled.size());
+    path.points.reserve(resampled.size());
 
     double cumulative_distance = 0.0;
     for (std::size_t k = 0; k < resampled.size(); ++k) {
         const delaunay::Point & p = resampled[k];
 
-        double yaw;
-        if (k + 1 < resampled.size()) {
-            const delaunay::Point & next = resampled[k + 1];
-            yaw = std::atan2(next.y - p.y, next.x - p.x);
-        } else {
-            const delaunay::Point & prev = resampled[k - 1];
-            yaw = std::atan2(p.y - prev.y, p.x - prev.x);
-        }
-
-        geometry_msgs::msg::PoseStamped pose;
-        pose.header = cone_map.header;
-        pose.pose.position.x = p.x;
-        pose.pose.position.y = p.y;
-        pose.pose.position.z = 0.0;
-        pose.pose.orientation = quaternionFromYaw(yaw);
-        path.poses.push_back(pose);
+        lart_msgs::msg::PathPoint point;
+        point.x = static_cast<float>(p.x);
+        point.y = static_cast<float>(p.y);
 
         if (k > 0) {
             const delaunay::Point & prev = resampled[k - 1];
             cumulative_distance += std::hypot(p.x - prev.x, p.y - prev.y);
         }
-        path.distance.push_back(static_cast<float>(cumulative_distance));
+        point.distance = static_cast<float>(cumulative_distance);
 
-        if (k > 0 && k + 1 < resampled.size()) {
-            path.curvature.push_back(curvatureAt(resampled[k - 1], resampled[k], resampled[k + 1]));
-        } else {
-            path.curvature.push_back(0.0f);
-        }
+        point.curvature =
+            curvatureAtWindow(resampled, k, kCurvatureHalfWindow, is_closed_loop, kPathPointSpacingM);
+
+        // No velocity profile yet - left at the field's default (0).
+        path.points.push_back(point);
     }
 
     return path;
