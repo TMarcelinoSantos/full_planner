@@ -27,6 +27,21 @@ constexpr int kSmoothingHalfWindow = 2;
 // the point itself.
 constexpr int kCurvatureHalfWindow = 4;
 
+// Stage 2 (Option A, baseline) velocity-profile parameters: a fixed
+// friction-circle grip budget, split between cornering (kMuLat) and
+// longitudinal braking/driving effort (kMuBrake/kMuDrive). "Simple" column
+// starting values from ARCHITECTURE2_NEW_DESIGN.md - conservative on
+// purpose, tune once the car is lapping reliably on these.
+constexpr double kMuLat = 1.0;
+constexpr double kMuBrake = 0.5;
+constexpr double kMuDrive = 0.5;
+constexpr double kVMaxMps = 20.0;
+constexpr double kGravityMps2 = 9.81;
+
+// Curvature floor used only for the velocity profile's lateral-grip pass,
+// so a dead-straight (curvature ~0) section doesn't divide by zero.
+constexpr double kMinCurvatureForSpeed = 1e-4;
+
 delaunay::Point toPoint(const geometry_msgs::msg::Point & p)
 {
     return {p.x, p.y};
@@ -182,6 +197,71 @@ float curvatureAtWindow(
     const double sign = (signed_area > 0.0) ? 1.0 : ((signed_area < 0.0) ? -1.0 : 0.0);
 
     return static_cast<float>(sign / radius);
+}
+
+// Stage 2 (Option A, baseline) of the T26 control architecture: a 3-pass
+// friction-circle speed profile over the whole path (see
+// ARCHITECTURE2_NEW_DESIGN.md "Stage 2 - Velocity profile (3-pass)"),
+// filling in `points[i].velocity` in place from the `curvature`/`distance`
+// each point was already given by computePath.
+//
+// Pass 1 caps every point at the speed lateral grip alone allows. Pass 2
+// sweeps backward from the end of the array so no point demands more
+// braking into the next corner than kMuBrake·g provides; pass 3 sweeps
+// forward from the start so no point demands more acceleration out of the
+// previous corner than kMuDrive·g provides - both via the friction circle,
+// i.e. whatever grip isn't already spent cornering.
+//
+// This always runs as a single straight sweep from points.front() to
+// points.back(), regardless of whether the path is a closed loop: the car
+// is assumed to already be moving when it starts using this map (no
+// standstill launch to anchor pass 1 at), and for now the profile doesn't
+// need to be consistent around the seam of a closed loop.
+void applyVelocityProfile(std::vector<lart_msgs::msg::PathPoint> & points)
+{
+    const std::size_t n = points.size();
+    if (n < 2) {
+        return;
+    }
+
+    std::vector<double> ds(n - 1);
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        ds[i] = static_cast<double>(points[i + 1].distance) - static_cast<double>(points[i].distance);
+    }
+
+    std::vector<double> kappa(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        kappa[i] = std::max(std::abs(static_cast<double>(points[i].curvature)), kMinCurvatureForSpeed);
+    }
+
+    // Pass 1: lateral grip ceiling.
+    std::vector<double> v(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        v[i] = std::min(std::sqrt(kMuLat * kGravityMps2 / kappa[i]), kVMaxMps);
+    }
+
+    // Pass 2: backward braking sweep, i = n-2..0.
+    for (std::size_t k = 0; k < n - 1; ++k) {
+        const std::size_t i = n - 2 - k;
+        const double a_lat = v[i + 1] * v[i + 1] * kappa[i + 1];
+        const double brake_budget = kMuBrake * kGravityMps2;
+        const double a_lon = std::sqrt(std::max(0.0, brake_budget * brake_budget - a_lat * a_lat));
+        const double v_lim = std::sqrt(v[i + 1] * v[i + 1] + 2.0 * a_lon * ds[i]);
+        v[i] = std::min(v[i], v_lim);
+    }
+
+    // Pass 3: forward traction sweep, i = 1..n-1.
+    for (std::size_t i = 1; i < n; ++i) {
+        const double a_lat = v[i - 1] * v[i - 1] * kappa[i - 1];
+        const double drive_budget = kMuDrive * kGravityMps2;
+        const double a_lon = std::sqrt(std::max(0.0, drive_budget * drive_budget - a_lat * a_lat));
+        const double v_lim = std::sqrt(v[i - 1] * v[i - 1] + 2.0 * a_lon * ds[i - 1]);
+        v[i] = std::min(v[i], v_lim);
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        points[i].velocity = static_cast<float>(v[i]);
+    }
 }
 
 // Walks the midpoint adjacency graph into a single ordered sequence covering
@@ -490,9 +570,10 @@ lart_msgs::msg::PathArray FullPlanner::computePath(const lart_msgs::msg::ConeArr
 
         point.curvature = curvatureAtWindow(resampled, k, kCurvatureHalfWindow, is_closed_loop);
 
-        // No velocity profile yet - left at the field's default (0).
         path.points.push_back(point);
     }
+
+    applyVelocityProfile(path.points);
 
     return path;
 }
