@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(lart_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
 
 include_directories(
   include
@@ -17,7 +18,7 @@ include_directories(
 )
 
 add_executable(full_planner_node src/planner_node.cpp src/full_planner.cpp)
-ament_target_dependencies(full_planner_node rclcpp geometry_msgs lart_msgs)
+ament_target_dependencies(full_planner_node rclcpp geometry_msgs lart_msgs visualization_msgs)
 
 install(TARGETS
   full_planner_node

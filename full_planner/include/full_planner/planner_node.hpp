@@ -27,7 +27,6 @@ private:
 protected:
     void slamMapCallback(const lart_msgs::msg::ConeArray::SharedPtr msg);
     void poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
-    void pathCallback(const lart_msgs::msg::PathArray::SharedPtr msg);
     void lapCallback(const lart_msgs::msg::SlamStats::SharedPtr msg);
     // Dumps the received cone map and the computed path to cones.csv and
     // path.csv under csv_output_dir_, for offline inspection with
@@ -38,14 +37,15 @@ protected:
     rclcpp::Subscription<lart_msgs::msg::ConeArray>::SharedPtr slam_map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
     rclcpp::Subscription<lart_msgs::msg::SlamStats>::SharedPtr lap_sub_;
-    rclcpp::Publisher<lart_msgs::msg::PathArray>::SharedPtr path_pub_;
+    rclcpp::Publisher<lart_msgs::msg::PathArray>::SharedPtr final_path_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr path_marker_pub_;
 
     FullPlanner full_planner_;
-    geometry_msgs::msg::PoseStamped latest_pose_;
+    lart_msgs::msg::PathArray full_final_path;
     bool map_completed_ = false;
     bool path_calculated_ = false;
-    bool has_pose_ = false;
     std::string csv_output_dir_;
+    std::size_t horizon_points_ = 100;
 };
 
 #endif

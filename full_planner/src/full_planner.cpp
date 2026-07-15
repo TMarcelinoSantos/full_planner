@@ -1,5 +1,7 @@
 #include "full_planner/full_planner.hpp"
 
+#include "geometry_msgs/msg/point.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -14,8 +16,8 @@ namespace
 
 constexpr std::size_t kInvalidIndex = std::numeric_limits<std::size_t>::max();
 
-// Target point density: 100 points per 20 m of path.
-constexpr double kPathPointSpacingM = 20.0 / 100.0;
+// Target point density: 100 points per 10 m of path.
+constexpr double kPathPointSpacingM = 10.0 / 100.0;
 
 // Half-width (in points) of the moving-average smoothing window applied to
 // the raw Delaunay-edge midpoints before resampling, to smooth out the
@@ -447,6 +449,10 @@ lart_msgs::msg::PathArray FullPlanner::computePath(const lart_msgs::msg::ConeArr
 {
     lart_msgs::msg::PathArray path;
     path.header = cone_map.header;
+    // The SLAM map's header doesn't carry a frame_id, so fall back to
+    // "world" - the fixed frame the rest of the stack (slam pose, map
+    // markers) publishes in.
+    path.header.frame_id = "world";
 
     std::vector<delaunay::Point> cone_points;
     std::vector<std::size_t> boundary_cone_indices;
@@ -576,4 +582,88 @@ lart_msgs::msg::PathArray FullPlanner::computePath(const lart_msgs::msg::ConeArr
     applyVelocityProfile(path.points);
 
     return path;
+}
+
+lart_msgs::msg::PathArray FullPlanner::computeHorizon(
+    const lart_msgs::msg::PathArray & full_path,
+    const geometry_msgs::msg::PoseStamped & current_pose,
+    std::size_t horizon_points) const
+{
+    lart_msgs::msg::PathArray horizon;
+    horizon.header = full_path.header;
+
+    const std::size_t n = full_path.points.size();
+    if (n == 0) {
+        return horizon;
+    }
+
+    std::size_t closest_idx = 0;
+    double closest_dist_sq = std::numeric_limits<double>::max();
+    const double x = current_pose.pose.position.x;
+    const double y = current_pose.pose.position.y;
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto & p = full_path.points[i];
+        const double dx = static_cast<double>(p.x) - x;
+        const double dy = static_cast<double>(p.y) - y;
+        const double dist_sq = dx * dx + dy * dy;
+        if (dist_sq < closest_dist_sq) {
+            closest_dist_sq = dist_sq;
+            closest_idx = i;
+        }
+    }
+
+    // A closed-loop track has its first and last resampled point coincide
+    // (see the ring-closing step above), so wrap past the start/finish line
+    // instead of stopping there. Index 0 is skipped on wrap-around since it
+    // duplicates the last point.
+    const lart_msgs::msg::PathPoint & first = full_path.points.front();
+    const lart_msgs::msg::PathPoint & last = full_path.points.back();
+    const bool is_closed_loop = n > 1 && std::hypot(first.x - last.x, first.y - last.y) < 1e-3;
+
+    horizon.points.reserve(std::min(horizon_points, n));
+    std::size_t idx = closest_idx;
+
+    for (std::size_t collected = 0; collected < horizon_points && collected < n; ++collected) {
+        horizon.points.push_back(full_path.points[idx]);
+
+        if (idx + 1 >= n) {
+            if (!is_closed_loop) {
+                break;
+            }
+            idx = 1; // skip index 0, it duplicates the last point
+        } else {
+            ++idx;
+        }
+    }
+
+    return horizon;
+}
+
+visualization_msgs::msg::MarkerArray FullPlanner::buildPathMarker(
+    const lart_msgs::msg::PathArray & path) const
+{
+    visualization_msgs::msg::Marker marker;
+    marker.header = path.header;
+    marker.ns = "full_planner_path";
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.15;
+    marker.color.r = 1.0f;
+    marker.color.g = 0.0f;
+    marker.color.b = 0.0f;
+    marker.color.a = 1.0f;
+
+    marker.points.reserve(path.points.size());
+    for (const auto & point : path.points) {
+        geometry_msgs::msg::Point p;
+        p.x = point.x;
+        p.y = point.y;
+        marker.points.push_back(p);
+    }
+
+    visualization_msgs::msg::MarkerArray markers;
+    markers.markers.push_back(marker);
+    return markers;
 }

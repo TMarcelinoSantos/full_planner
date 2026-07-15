@@ -6,7 +6,8 @@ using std::placeholders::_1;
 
 PlannerNode::PlannerNode(): Node("full_planner_node")
 {
-    csv_output_dir_ = this->declare_parameter<std::string>("csv_output_dir", "/home/tomas/data/ros2_ws");
+    csv_output_dir_ = this->declare_parameter<std::string>("csv_output_dir", "/home/lart/ros2_ws");
+    horizon_points_ = static_cast<std::size_t>(this->declare_parameter<int>("horizon_points", 100));
 
     slam_map_sub_ = this->create_subscription<lart_msgs::msg::ConeArray>(
         TOPIC_MAP, 10, std::bind(&PlannerNode::slamMapCallback, this, _1));
@@ -18,7 +19,8 @@ PlannerNode::PlannerNode(): Node("full_planner_node")
         TOPIC_STATS, 10, std::bind(&PlannerNode::lapCallback, this, _1)
     );
 
-    path_pub_ = this->create_publisher<lart_msgs::msg::PathArray>(TOPIC_PATH, 10);
+    final_path_pub_ = this->create_publisher<lart_msgs::msg::PathArray>(TOPIC_FINAL_PATH, 10);
+    path_marker_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(TOPIC_FINAL_PATH_MARKER, 10);
 }
 
 void PlannerNode::lapCallback(const lart_msgs::msg::SlamStats::SharedPtr msg)
@@ -45,17 +47,16 @@ void PlannerNode::slamMapCallback(const lart_msgs::msg::ConeArray::SharedPtr msg
         return;
     }
 
-    const lart_msgs::msg::PathArray path = full_planner_.computePath(*msg);
-    if (path.points.empty()) {
+    this->full_final_path = full_planner_.computePath(*msg);
+    if (full_final_path.points.empty()) {
         RCLCPP_WARN(this->get_logger(), "Could not build a midline path from the received cone map");
         return;
     }
 
     this->path_calculated_ = true;
-    //path_pub_->publish(path);
 
     writeConesCsv(*msg);
-    writePathCsv(path);
+    writePathCsv(full_final_path);
 }
 
 void PlannerNode::writeConesCsv(const lart_msgs::msg::ConeArray & cone_map) const
@@ -98,8 +99,13 @@ void PlannerNode::poseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr 
     RCLCPP_INFO(this->get_logger(), "Received pose: [x: %f, y: %f]",
                 msg->pose.position.x, msg->pose.position.y);
 
-    latest_pose_ = *msg;
-    has_pose_ = true;
+    if (!path_calculated_) {
+        return;
+    }
+
+    const lart_msgs::msg::PathArray horizon = full_planner_.computeHorizon(full_final_path, *msg, horizon_points_);
+    final_path_pub_->publish(horizon);
+    path_marker_pub_->publish(full_planner_.buildPathMarker(horizon));
 }
 
 int main(int argc, char *argv[])
